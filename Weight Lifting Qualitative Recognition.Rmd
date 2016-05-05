@@ -1,0 +1,394 @@
+---
+title: "Weight Lifting Qualitative Prediction Model Assessment"
+author: "Lynn W. Fleming"
+date: "April 29, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+Human activity recognition research focus has been on quantifying how **much** of a certain activity has been done but rarely about how **well** it has been carried out. For instance, large amounts of data are collected by individuals with their *Fitbit*, *Nike FuelBand*, or *Jawbone Up* body mounted sensors to determine what type of exercise and how much of it is being done. Therefore, a group of researchers decided to experiment with determining the quality of the exercise being performed. Their goal was to generate a data set for the purposes of classifying how well test subjects performed a simple bicep curl utilizing body mounted sensors and assessing whether it would be possible in the future to build a classification model and provide real time feedback to the user[1]. 
+
+IMUs (inertial measurement units) consisting of gyroscopes, accelerometers, and magnetometers were attached to the arm, forearm, belt and dumbbell of six subjects. Each subject performed 10 repetitions of a Unilateral Dumbbell Biceps Curl in five different ways. A personal trainer ensured that the subjects performed it perfectly (class A), throwing elbows to the front (class B), lifting the dumbbell only half way (class C), lowering the dumbbell only halfway class D) and throwing the hips to the front (class E). 
+
+The purpose of this analysis is to find the best fit models for classifying the data from the above mentioned data set. In general, the following steps were taken:
+
+1. Analyze the given training data set for missing values (i.e., NAs), covariates for dependency, and nonzero variance traits. Subset the original training set for some of the chosen features and then create a second set of training and testing data sets with added features for comparing model performance.
+
+2. Partition the subsetted training set into new training and testing data sets. The final model will be validated with a separate test set one time only.
+
+3. Choose a few models to start with that have strengths in classifying outcomes. Train each model and assess model fit on the testing data set by looking at accuracy as the measure of out of sample error.
+
+4. Try preprocessing on the features with either Principal Components Analysis (PCA) or centering and scaling of the data.
+
+5. Use the second data set with added features to training/testing set and repeat steps 2 through 4.
+
+
+```{r initialize, include = FALSE}
+
+setwd("~/DataScience/Machine Learning/Week 4")
+
+library(fastAdaboost)
+library(MASS)
+library(klaR)
+library(ggplot2)
+library(caret)
+library(kernlab)
+library(xtable)
+library(randomForest)
+
+#Read in training data file.
+
+trainingFile <- "pml-training.csv"
+trainData <- read.csv(trainingFile, na.strings = "#DIV/0!")
+
+#Read in final test data to be used only once after final model has been
+#determined.
+finaltestFile <- "pml-testing.csv"
+finalData <- read.csv(finaltestFile, na.strings = "#DIV/0!")
+
+```
+
+## Data exploration and feature selection
+
+```{r dataExploration, include = FALSE}
+str(trainData)
+names(trainData)
+
+```
+
+
+There are 160 variables and 19622 observations in the original data. The variables consist of subject names, raw time stamps and the raw data outputs from the four 9 degrees of freedom Razor inertial measurement units which provide three-axes accelerometer, gyroscope, and magnetometer data for the belt, arm, dumbbell, and forearm. For each of the sensors, the following were also calculated and included in the data set: roll, pitch, yaw, min, max, amplitudes, totals, variances, standard deviations, skewness, and kurtosis.
+
+####First training and testing data sets (referred to as raw data):
+The raw data variables from the sensors were chosen for the initial data set for the following reasons:
+
+1) One of the end goals for this analysis is to determine whether qualitative feedback can be given in real time. If this is the case, then the features that are most important are the raw IMU sensor outputs for the x, y, and z axes. Calculating all of the original data set features (i.e., standard deviation, skewness) would increasing the real time data processing and therefore slow the feedback.
+
+2) After calculating the near-zero variance of the variables with the nearZeroVar() function, it was determined that all of the raw data from all four IMUs had significant values. There were 77 of the other covariates that should be considered for elimination as they may not contribute to the model predictors.
+```{r zeroCovariateCheck, include = FALSE}
+
+#Check for near zero covariates to eliminate and improve speed of training
+zeroVar <- nearZeroVar(trainData[,-160],saveMetrics=TRUE)
+nonzeroVars <- names(trainData[,zeroVar$nzv == FALSE])
+length(nonzeroVars) #number of variables with high variance
+```
+
+3) Interpreting the results are straightforward.
+
+4) No missing values so it's a complete data set. No induced errors with imputating missing values.
+
+5) Do not include time stamps as speed of performing exercise will not be considered. We will be looking at positional data from IMUs.
+
+The raw data set covariate names:
+
+```{r rawData}
+rawData <- trainData[,c(37:45, 60:68, 113:121, 151:160)]
+names(rawData)
+```
+
+
+####Second training and testing data sets (referred to as raw + roll, pitch, and yaw data):
+
+Included in the original data set are the pitch, roll, and yaw features for the 4 sensors. These were calculated from the raw sensor data using Euler angles and therefore is another complete data set. New models were trained with these added covariates to see if there was improvement in the model fit accuracy.
+
+```{r subsetData2}
+
+rawrpyData <- trainData[,c(8:10, 37:48, 60:68, 84:86, 113:124, 151:160)]
+names(rawrpyData)
+
+```
+
+###Are variables highly correlated?
+
+```{r varCorr}
+
+matrix <- abs(cor(rawrpyData[,-49]))
+diag(matrix) <- 0
+highCor <- which(matrix > 0.8, arr.ind = TRUE)
+
+```
+
+Another characteristic of the covariates that is important to understand is whether the variables are highly correlated with each other. After executing the above code, it was determined that `r dim(highCor)[1]` of the `r dim(rawrpyData)[2]-1` covariates are dependent on each other (covariance of 0.8 or higher). This is significant and so will be considered when selecting the model methods.
+
+###Data partition 
+
+Because the initial training data set contains a large sample size, it was partitioned into new training and testing sets at 75% and 25% divisions, respectively. This allows for cross validation between the training and testing subsets for each model studied. After the final model is chosen, then it will be validated one time only against the final testing data set.
+
+```{r partitionData}
+set.seed(23456)
+#Partition first data subset
+inTrain <- createDataPartition(y = rawData$classe, p = 0.75, list=FALSE)
+training <- rawData[inTrain,]
+testing <- rawData[-inTrain,]
+
+#Partition second data subset
+inTrain2 <- createDataPartition(y = rawrpyData$classe, p = 0.75, list=FALSE)
+training2 <- rawrpyData[inTrain2,]
+testing2 <- rawrpyData[-inTrain2,]
+
+```
+
+
+##Optimal Machine Learning Algorithms
+
+The train(), predict(), confusionMatrix() functions were used throughout this model building process. The various algorithms were identified with the function argument method = "rf" or "gbm" for Random Forests and Stochastic Gradient Boosting, for example. The resulting model was then used to predict the appropriate class with the testing data. The out-of-sample error metric used is the accuracy because of classifying outcomes. These prediction accuracies were determined from the confusionMatrix() function.
+
+Note that the code chunks contain the actual R scripts run to obtain the results in this document. Because of the very long computer run times, the results were recorded separately and entered back in to this document. This was in lieu of attempting to cache the results from each code chunk and knitting this .Rmd document.
+
+##A) Run the following models with the first (raw) data set:
+
+###1. Random Forests
+
+Random forests can make much better predictions than linear models in that they can deal with nonlinear predictors. Random forests are much less prone to overfitting than a single decision tree, but overfitting can still occur in very noisy data. A big drawback for this method is the computer execution time required to build this model. If possible, use the argument in the train() function for parallel processing. 
+
+
+```{r randomForest, eval = FALSE}
+
+#Use random forest as first model attempt
+modelFit1 <- train(classe ~., data=training, method = "rf")#accuracy .987
+
+predmodelFit1 <- predict(modelFit1, testing)
+cMatrix1 <- confusionMatrix(predmodelFit1,testing$classe) #out of sample error
+
+
+```
+
+Overall Statistics
+                                          
+               Accuracy : 0.9865          
+                 95% CI : (0.9829, 0.9896)
+    No Information Rate : 0.2845          
+    P-Value [Acc > NIR] : < 2.2e-16       
+                                          
+###2.Stochastic Gradient Boosting
+
+As stated in the referenced paper [1], the body mounted sensors are very noisy. Boosting with trees is beneficial in this case as a lot of the noise can be averaged out. A note about using "gbm", the model will assume multinomial distribution if the response is a factor with more than 2 responses.
+
+```{r boosting, eval = FALSE}
+
+modelFit2 <- train(classe ~., data=training, method = "gbm", verbose=FALSE)
+predmodelFit2 <- predict(modelFit2, testing)
+cMatrix2 <- confusionMatrix(predmodelFit2,testing$classe) #out of sample error
+
+```
+
+Overall Statistics
+                                          
+               Accuracy : 0.9031          
+                 95% CI : (0.8945, 0.9113)
+    No Information Rate : 0.2845          
+    P-Value [Acc > NIR] : < 2.2e-16       
+                                          
+
+####a. With center and scaling preprocessing
+
+```{r boostingPreProc, eval = FALSE}
+#run again with preprocessing - improved by only .04% in accuracy
+modelFit2PreProc <- train(classe ~., data=training, preProcess = c("center","scale"), method = "gbm",verbose=FALSE)
+predmodelFit2PreProc <- predict(modelFit2PreProc, testing)
+cMatrix2PreProc <- confusionMatrix(predmodelFit2PreProc,testing$classe) #out of sample error
+
+```
+
+Overall Statistics
+                                          
+               Accuracy : 0.9035          
+                 95% CI : (0.8949, 0.9117)
+    No Information Rate : 0.2845          
+    P-Value [Acc > NIR] : < 2.2e-16       
+ 
+####b. With PCA
+
+About half of the raw data variables are highly correlated >0.8. In order to account for this high feature dependency, a model was fitted using Principal Component Analysis (PCA).
+
+
+```{r boostingPCA, eval = FALSE}
+
+modelFit2PCA <- train(classe~., data=training, preProcess="pca", method="gbm", verbose=FALSE)
+predmodelFit2PCA <- predict(modelFit2PCA, testing)
+cMatrix2PCA <- confusionMatrix(predmodelFit2PCA,testing$classe) #out of sample error
+
+```
+
+Overall Statistics
+                                          
+               Accuracy : 0.7739          
+                 95% CI : (0.7619, 0.7855)
+    No Information Rate : 0.2845          
+    P-Value [Acc > NIR] : < 2.2e-16
+
+###3. Bagged Classification And Regression Tree (CART)
+
+```{r treebag, eval = FALSE}
+
+modelFit4 <- train(classe ~., data=training, method = "treebag")
+predmodelFit4 <- predict(modelFit4, testing)
+cMatrix4 <- confusionMatrix(predmodelFit4,testing$classe) #out of sample error
+
+```
+
+Overall Statistics
+                                          
+               Accuracy : 0.978           
+                 95% CI : (0.9735, 0.9819)
+    No Information Rate : 0.2845          
+    P-Value [Acc > NIR] : < 2e-16         
+                                          
+
+###4. AdaBoost Classification Trees
+
+Attempted to run this model but encountered run time errors.
+
+```{r adaboost, eval = FALSE}
+
+modelFit3 <- train(classe ~., data=training, method = "adaboost")
+predmodelFit3 <- predict(modelFit3, testing)
+cMatrix3 <- confusionMatrix(predmodelFit3,testing$classe) #out of sample error
+
+```
+
+
+###5.Naive Bayes
+
+This model assumes variables are independent which may not be beneficial with these data sets since they are highly correlated.
+```{r naivebayes, eval = FALSE}
+
+modelFit5 <- train(classe ~., data=training, method = "nb")
+predmodelFit5 <- predict(modelFit5, testing)
+cMatrix5 <- confusionMatrix(predmodelFit5,testing$classe) #out of sample error
+
+```
+
+There were some run time errors with this, so not convinced the results are real.
+
+Overall Statistics
+                                          
+               Accuracy : 0.7074          
+                 95% CI : (0.6944, 0.7201)
+    No Information Rate : 0.2845          
+    P-Value [Acc > NIR] : < 2.2e-16       
+                                          
+###6. Linear Discriminant Analysis (LDA)
+
+This method assumes the variables are independent and normally distributed, which is not the case here. With the resulting accuracy of .625 as shown below, this is confirmation that LDA is not the best algorithm to use for these data sets.
+
+```{r lda, eval = FALSE}
+
+modelFit6 <- train(classe ~., data=training, method = "lda")
+predmodelFit6 <- predict(modelFit6, testing)
+cMatrix6 <- confusionMatrix(predmodelFit6,testing$classe) #out of sample error
+
+```
+
+Overall Statistics
+                                          
+               Accuracy : 0.6248          
+                 95% CI : (0.6111, 0.6384)
+    No Information Rate : 0.2845          
+    P-Value [Acc > NIR] : < 2.2e-16       
+                                          
+##B) New data set with added roll, pitch, and yaw variables
+
+###1. Random Forest with added roll, pitch, yaw data
+
+```{r randomforest2, eval = FALSE}
+
+modelFit11 <- train(classe ~., data=training2, method = "rf")
+predmodelFit11 <- predict(modelFit11, testing2)
+cMatrix11 <- confusionMatrix(predmodelFit11,testing2$classe) #out of sample error
+
+```
+
+Overall Statistics
+                                         
+               Accuracy : 0.9945         
+                 95% CI : (0.992, 0.9964)
+    No Information Rate : 0.2845         
+    P-Value [Acc > NIR] : < 2.2e-16      
+                                         
+
+###2.Stochastic Gradient Boosting with added roll, pitch and yaw data
+
+```{r boosting2, eval = FALSE}
+
+modelFit22 <- train(classe ~., data=training2, method = "gbm", verbose=FALSE)
+predmodelFit22 <- predict(modelFit22, testing2)
+cMatrix22 <- confusionMatrix(predmodelFit22,testing2$classe) #out of sample error
+
+```
+
+Overall Statistics
+                                          
+               Accuracy : 0.9602          
+                 95% CI : (0.9544, 0.9655)
+    No Information Rate : 0.2845          
+    P-Value [Acc > NIR] : < 2.2e-16
+
+###3. Bagged CART (Treebag) with added roll, pitch and yaw data
+
+```{r treebag2, eval = FALSE}
+
+modelFit44 <- train(classe ~., data=training2, method = "treebag")
+predmodelFit44 <- predict(modelFit44, testing2)
+cMatrix44 <- confusionMatrix(predmodelFit44,testing2$classe) #out of sample error
+
+```
+
+Overall Statistics
+                                          
+               Accuracy : 0.9886          
+                 95% CI : (0.9852, 0.9914)
+    No Information Rate : 0.2845          
+    P-Value [Acc > NIR] : <2e-16          
+                                          
+##Results
+
+The table below summarizes all of the models run, their methods, first or second data set, and the in-sample and out-of-sample error for each. Note that raw + p,r,y is the second data set used that includes the raw plus pitch, roll, and yaw data from the four sensors.
+
+|      Model      |     Method     |     Dataset     |       Accuracy         |
+|-----------------|----------------|-----------------|------------------------|
+|                 |                |                 |In-sample/Out-of-sample |
+|Randomforest     | "rf"           |raw only         | .981 / .987            |
+|                 |                |raw + p, r, y    |  .983/.994             | 
+|                 |                |                 |                        |
+|Stoch. Gradient  |                |                 |                        |
+|Boosting         |"gbm"           |raw only         | .905/.908              |
+|                 |                |raw + p, r, y    | .960/.960              |
+|                 |preProcess=     |                 |                        |
+|                 |center/scale    |raw only         | .903/.904              |
+|                 |                |                 |                        |
+|                 |preProcess=PCA  |raw only         | .764/.774              |
+|                 |                |                 |                        |
+|Bagged CART      |"treebag"       |raw only         | .961/.978              |
+|                 |                |raw + p, r, y    |  .979/.989             |
+|                 |                |                 |                        |
+|Linear Discrim.  |"lda"           |raw only         |.636 /.625              |
+|Analysis         |                |                 |                        |
+|                 |                |                 |                        |
+|Naive Bayes      |"nb"            |raw only         |.71/.707 (run error)    |
+|                 |                |                 |                        |
+|AdaBoost         |"adaboost"      |raw only         |(run time error)        |
+
+
+From the above table, the second data set with the pitch, roll, and yaw added features appear to have improved the model accuracy or out of sample error rate. Using either data set with the random forests algorithm provided the most accurate predictions. Random forests are also less prone to overfitting but since the data from these sensors is noisy (as stated in referenced paper below), this may not be the case.
+
+##Final Model Validation
+
+The random forest model trained with the second data set is used to predict the final data set. First, the 48 features used in the data set have to be subset from the final test set. Because this paper is a required assignment for the Coursera Machine Learning course, the model predictions on the test set were confirmed with an online "quiz". In conclusion, this model predicted 100% of the 20 test sample classes.
+
+```{r finalvalidation, eval=FALSE}
+#Subset data with raw data plus roll, pitch and yaw
+testingDataFinal <- finalData[,c(8:10, 37:48, 60:68, 84:86, 113:124, 151:160)]
+#Use the random forest with second data set modelFit11
+predmodelFitFinal <- predict(modelFit11, testingDataFinal)
+```
+
+
+##References
+
+[1]E. Velloso, A. Bulling, H. Gellersen, W. Ugulino, H. Fuks. Qualitative Activity Recognition of Weight Lifting Exercises. In *Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13)* Stutgart, Germany:ACM SIGCHI, 2013.
